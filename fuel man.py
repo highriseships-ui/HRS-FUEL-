@@ -5,14 +5,17 @@ import altair as alt
 from datetime import datetime
 import json
 import os
+import io
+import hashlib
 
 # --- CONFIG & VERSIONING ---
-APP_VERSION = "v1.1.4"
+APP_VERSION = "v1.2.0"
 st.set_page_config(page_title="HRS Fleet Manager", layout="wide", page_icon="⚓")
 
 # --- PERSISTENT STORAGE FILES ---
 PINS_FILE = "hrs_pins.json"
 LEDGER_FILE = "hrs_ledger_db.csv"
+HASHES_FILE = "hrs_uploaded_hashes.json"
 MASTER_RECOVERY_CODE = "181112"
 
 def load_pins():
@@ -28,8 +31,24 @@ def save_pins(pins_dict):
     with open(PINS_FILE, "w") as f:
         json.dump(pins_dict, f)
 
+def load_hashes():
+    if os.path.exists(HASHES_FILE):
+        try:
+            with open(HASHES_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def save_hashes(hashes_set):
+    with open(HASHES_FILE, "w") as f:
+        json.dump(list(hashes_set), f)
+
 if "pins" not in st.session_state:
     st.session_state.pins = load_pins()
+
+if "processed_hashes" not in st.session_state:
+    st.session_state.processed_hashes = load_hashes()
 
 # --- TWO-TIER AUTHENTICATION GATE & RECOVERY ---
 if "authenticated" not in st.session_state:
@@ -39,37 +58,40 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.title("⚓ HRS Fleet Fuel Manager")
-    st.subheader("🔐 Secure Role Login")
-    st.markdown("Enter your **6-digit Owner PIN** or **4-digit Assistant PIN**.")
+    st.subheader("🔐 Secure Portal Access")
+    st.markdown("Please enter your **6-digit Owner Password** or **4-digit Assistant Password** to continue.")
     
-    pin_input = st.text_input("Enter PIN Code:", type="password", max_chars=6)
-    
-    if st.button("Login"):
-        if pin_input == st.session_state.pins["owner_pin"]:
-            st.session_state.authenticated = True
-            st.session_state.user_role = "Owner"
-            st.session_state.recovered_login = False
-            st.rerun()
-        elif pin_input == st.session_state.pins["assistant_pin"]:
-            st.session_state.authenticated = True
-            st.session_state.user_role = "Assistant"
-            st.session_state.recovered_login = False
-            st.rerun()
-        else:
-            st.error("🚨 Invalid PIN. Please check your 6-digit or 4-digit code.")
+    with st.form("login_form"):
+        pin_input = st.text_input("Password / Access Code:", type="password", max_chars=6, placeholder="Enter 4 or 6 digit code")
+        submit_login = st.form_submit_button("🔓 Login to Fleet Manager")
+        
+        if submit_login:
+            if pin_input == st.session_state.pins["owner_pin"]:
+                st.session_state.authenticated = True
+                st.session_state.user_role = "Owner"
+                st.session_state.recovered_login = False
+                st.rerun()
+            elif pin_input == st.session_state.pins["assistant_pin"]:
+                st.session_state.authenticated = True
+                st.session_state.user_role = "Assistant"
+                st.session_state.recovered_login = False
+                st.rerun()
+            else:
+                st.error("🚨 Invalid Password. Please check your 6-digit Owner or 4-digit Assistant code.")
             
     st.markdown("---")
     with st.expander("❓ Forgot Owner Password?"):
-        st.markdown("Enter your **6-digit Master Recovery Code** to unlock Owner profile.")
-        rec_in = st.text_input("Recovery Code:", type="password", max_chars=6, key="rec")
-        if st.button("Unlock Owner Profile"):
-            if rec_in == MASTER_RECOVERY_CODE:
-                st.session_state.authenticated = True
-                st.session_state.user_role = "Owner"
-                st.session_state.recovered_login = True
-                st.rerun()
-            else:
-                st.error("🚨 Invalid Recovery Code.")
+        st.markdown("Enter your **6-digit Master Recovery Code** to unlock your Owner profile and reset your password.")
+        with st.form("recovery_form"):
+            rec_in = st.text_input("Master Recovery Code:", type="password", max_chars=6, key="rec")
+            if st.form_submit_button("🛠️ Unlock Owner Profile"):
+                if rec_in == MASTER_RECOVERY_CODE:
+                    st.session_state.authenticated = True
+                    st.session_state.user_role = "Owner"
+                    st.session_state.recovered_login = True
+                    st.rerun()
+                else:
+                    st.error("🚨 Invalid Master Recovery Code.")
     st.stop()
 
 # --- TOP BAR: USER ROLE, LOGOUT & LIVE CLOCK ---
@@ -79,7 +101,7 @@ with top_col1:
 with top_col2:
     role_label = st.session_state.user_role
     st.markdown(
-        f"<div style='text-align:right;padding-top:15px;'>👤 Role: <b>{role_label}</b></div>",
+        f"<div style='text-align:right;padding-top:15px;'>👤 Logged in as: <b>{role_label}</b></div>",
         unsafe_allow_html=True
     )
     if st.button("🚪 Logout", use_container_width=True):
@@ -111,7 +133,7 @@ with top_col3:
     )
 
 if st.session_state.get("recovered_login", False):
-    st.warning("🔓 Logged in via Recovery Code (181112). Go to Tab 3 to update your Owner PIN.")
+    st.warning("🔓 Logged in via Master Recovery Code (181112). Go to the bottom of Tab 3 ('⚙️ Master Ledger & Audit') to update your Owner Password.")
 
 # --- 1. INITIALIZE DATABASE & BALANCES ---
 vessels = ["Falcon High", "Aarya", "Kingfisher", "Phoenix"]
@@ -183,13 +205,10 @@ if "ledger" not in st.session_state:
         st.session_state.next_id = 1
     else:
         max_id = pd.to_numeric(st.session_state.ledger["Record ID"], errors="coerce").max()
-        st.session_state.next_id = int(max_id) + 1
+        st.session_state.next_id = int(max_id) + 1 if pd.notna(max_id) else 1
 
 if "session_logs" not in st.session_state:
     st.session_state.session_logs = []
-
-if "processed_csvs" not in st.session_state:
-    st.session_state.processed_csvs = set()
 
 # --- 2. DYNAMIC CALCULATORS ---
 def get_active_ledger():
@@ -394,58 +413,104 @@ with tab2:
             st.text(log)
 
     st.markdown("---")
-    st.subheader("📂 Offline Logs: Bulk CSV Upload")
-    st.info("Convert WhatsApp photos to CSV using AI, then drag and drop the file below.")
-    uploaded_csv = st.file_uploader("📂 Drag and drop your CSV file here, or click to browse", type=["csv"])
+    st.subheader("📂 Offline Logs: Bulk CSV Upload (Two-Tier Smart Safeguard)")
+    st.info("Upload converted CSV files below. Identical files (even if renamed) are strictly blocked, while separate voyages with similar readings will prompt for your confirmation.")
+    uploaded_csv = st.file_uploader("📂 Drag and drop your CSV file here, or tap to browse", type=["csv"])
     
     if uploaded_csv:
-        if uploaded_csv.name in st.session_state.processed_csvs:
-            st.warning("⚠️ This file was already uploaded in this session. Check before injecting.")
-            
-        try:
-            df_upload = pd.read_csv(uploaded_csv)
-            if st.button("Inject Data into Master Ledger"):
-                for _, row in df_upload.iterrows():
-                    r_dict = row.to_dict()
-                    r_dict["Record ID"] = st.session_state.next_id
-                    r_dict["Timestamp"] = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                    r_dict["Logged By"] = st.session_state.user_role
-                    r_dict["Status"] = "Active"
-                    r_dict["Original_ID"] = "-"
-                    
-                    if "Distance (NM)" not in r_dict:
-                        r_dict["Distance (NM)"] = 0.0
-                    if "Voyage Month" not in r_dict:
-                        try:
-                            dt_o = datetime.strptime(str(r_dict["Date"]), "%d-%m-%Y")
-                            r_dict["Voyage Month"] = dt_o.strftime("%b-%Y")
-                        except Exception:
-                            r_dict["Voyage Month"] = "Unknown"
-                            
-                    c_row = {col: r_dict.get(col, "-") for col in LEDGER_COLUMNS}
-                    st.session_state.ledger = pd.concat(
-                        [st.session_state.ledger, pd.DataFrame([c_row])],
-                        ignore_index=True
-                    )
-                    st.session_state.next_id += 1
+        file_bytes = uploaded_csv.getvalue()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        
+        # TIER 1: Exact File Content Match (Hard Block)
+        if file_hash in st.session_state.processed_hashes:
+            st.error("🚨 **Duplicate File Blocked:** This exact CSV file content has already been uploaded to the system. Even if saved under a different name, re-uploading the same file is not permitted.")
+        else:
+            try:
+                df_upload = pd.read_csv(io.BytesIO(file_bytes))
                 
-                save_ledger()
-                st.session_state.processed_csvs.add(uploaded_csv.name)
-                st.success(f"✅ CSV '{uploaded_csv.name}' Uploaded by {st.session_state.user_role}!")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Error reading CSV format: {e}")
+                # TIER 2: Smart Similarity Check (Check if readings/liters/equipment match existing active entries)
+                active_check_df = get_active_ledger()
+                similar_warnings = []
+                
+                if not active_check_df.empty and all(c in df_upload.columns for c in ["Vessel", "Equipment", "Liters"]):
+                    for idx, u_row in df_upload.iterrows():
+                        u_ves = str(u_row.get("Vessel", ""))
+                        u_eq = str(u_row.get("Equipment", ""))
+                        u_ltr = pd.to_numeric(u_row.get("Liters", 0), errors="coerce") or 0.0
+                        u_dt = str(u_row.get("Date", ""))
+                        
+                        matches = active_check_df[
+                            (active_check_df["Vessel"].astype(str) == u_ves) &
+                            (active_check_df["Equipment"].astype(str) == u_eq) &
+                            (pd.to_numeric(active_check_df["Liters"], errors="coerce") == u_ltr)
+                        ]
+                        if not matches.empty:
+                            existing_voy = matches.iloc[0]["Voyage No"]
+                            existing_dt = matches.iloc[0]["Date"]
+                            similar_warnings.append(
+                                f"Row {idx+1} ({u_ves} | {u_eq} | {u_ltr} L on {u_dt}) matches existing reading from Voyage {existing_voy} ({existing_dt})."
+                            )
+                
+                allow_inject = True
+                if similar_warnings:
+                    st.warning(
+                        f"⚠️ **Similar Data / Readings Detected ({len(similar_warnings)} matching entries):**\n"
+                        "This file is not an identical file copy, but it contains fuel readings that match existing records in your ledger:"
+                    )
+                    with st.expander("View Matching Readings Details"):
+                        for w in similar_warnings[:10]:
+                            st.write(f"- {w}")
+                        if len(similar_warnings) > 10:
+                            st.write(f"...and {len(similar_warnings) - 10} more matching readings.")
+                            
+                    allow_inject = st.checkbox(
+                        "☑️ Do you really want to upload this? I confirm these are legitimate readings for a separate trip/log.",
+                        key=f"confirm_sim_{file_hash[:8]}"
+                    )
+                
+                if st.button("Inject Data into Master Ledger", disabled=not allow_inject):
+                    for _, row in df_upload.iterrows():
+                        r_dict = row.to_dict()
+                        r_dict["Record ID"] = st.session_state.next_id
+                        r_dict["Timestamp"] = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                        r_dict["Logged By"] = st.session_state.user_role
+                        r_dict["Status"] = "Active"
+                        r_dict["Original_ID"] = "-"
+                        
+                        if "Distance (NM)" not in r_dict:
+                            r_dict["Distance (NM)"] = 0.0
+                        if "Voyage Month" not in r_dict:
+                            try:
+                                dt_o = datetime.strptime(str(r_dict["Date"]), "%d-%m-%Y")
+                                r_dict["Voyage Month"] = dt_o.strftime("%b-%Y")
+                            except Exception:
+                                r_dict["Voyage Month"] = "Unknown"
+                                
+                        c_row = {col: r_dict.get(col, "-") for col in LEDGER_COLUMNS}
+                        st.session_state.ledger = pd.concat(
+                            [st.session_state.ledger, pd.DataFrame([c_row])],
+                            ignore_index=True
+                        )
+                        st.session_state.next_id += 1
+                    
+                    save_ledger()
+                    st.session_state.processed_hashes.add(file_hash)
+                    save_hashes(st.session_state.processed_hashes)
+                    st.success(f"✅ CSV '{uploaded_csv.name}' Uploaded Successfully by {st.session_state.user_role}!")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error reading CSV format: {e}")
 
 # ==========================================
 # TAB 3: MASTER LEDGER, AUDIT & VOYAGE ANALYTICS
 # ==========================================
 with tab3:
-    st.subheader("🔍 Search & Filter Ledger")
+    st.subheader("🔍 Search, Filter & Manage Master Ledger")
     
     f_col1, f_col2, f_col3 = st.columns([1, 1, 2])
     vessel_filter = f_col1.selectbox("Filter by Vessel", ["All Fleet"] + vessels)
     role_filter = f_col2.selectbox("Filter by Role (Logged By)", ["All Roles", "Owner", "Assistant"])
-    search_query = f_col3.text_input("Search Keyword (Voyage, Remarks, Counterparty, etc.)")
+    search_query = f_col3.text_input("Search Keyword (Voyage, Remarks, Equipment, Date, etc.)")
     
     active_df = get_active_ledger().copy()
     if not active_df.empty:
@@ -462,35 +527,83 @@ with tab3:
         ).any(axis=1)
         display_df = display_df[mask]
         
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
-    st.download_button(
-        label="📥 Export Filtered Data to CSV",
-        data=display_df.to_csv(index=False).encode('utf-8'),
-        file_name=f"HRS_Fuel_Ledger_{datetime.now().strftime('%d_%m_%Y')}.csv",
-        mime="text/csv",
-    )
-    
-    st.markdown("---")
-    st.subheader("🛠️ Amend / Delete an Entry")
-    
+    # --- INTERACTIVE CHECKBOX LEDGER FOR MULTI-DELETE ---
     if not display_df.empty:
-        sno_to_amend = st.selectbox("Select S.No to Edit", display_df["S.No"].tolist())
+        st.markdown("#### ☑️ Interactive Ledger (Check Boxes to Delete Multiple Entries)")
+        st.caption("Tick individual checkboxes in the 'Select' column below, or use 'Select All' to bulk-delete entries.")
+        
+        sel_col1, sel_col2 = st.columns([1, 3])
+        select_all = sel_col1.checkbox("☑️ Select All Visible Entries", value=False, key="select_all_toggle")
+        
+        multidel_df = display_df.copy()
+        multidel_df.insert(0, "Select", select_all)
+        
+        disabled_cols = [c for c in multidel_df.columns if c != "Select"]
+        
+        edited_multidel = st.data_editor(
+            multidel_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=disabled_cols,
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select", help="Check to select this entry for deletion", default=False)
+            },
+            key="multi_delete_editor"
+        )
+        
+        selected_rows = edited_multidel[edited_multidel["Select"] == True]
+        selected_sno = selected_rows["S.No"].tolist()
+        
+        if selected_sno:
+            st.warning(f"⚠️ You have checked **{len(selected_sno)}** entry/entries for deletion (S.No: {selected_sno}).")
+            del_col1, del_col2 = st.columns([3, 1])
+            del_reason = del_col1.text_input("Reason for Deletion (Required for Audit History)", placeholder="e.g., Duplicate entry / Wrong voyage log", key="bulk_del_reason")
+            
+            with del_col2:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Delete Checked Entries", type="primary", use_container_width=True):
+                    if not del_reason:
+                        st.error("🚨 Please enter a reason for the audit log before deleting.")
+                    else:
+                        role = st.session_state.user_role
+                        for sno in selected_sno:
+                            t_row = display_df[display_df["S.No"] == sno].iloc[0]
+                            r_id = t_row["Record ID"]
+                            idx_mask = st.session_state.ledger["Record ID"] == r_id
+                            old_rem = str(t_row['Remarks'])
+                            st.session_state.ledger.loc[idx_mask, "Status"] = f"Voided (by {role})"
+                            st.session_state.ledger.loc[idx_mask, "Remarks"] = f"{old_rem} | Bulk Deleted by {role}: {del_reason}"
+                        
+                        save_ledger()
+                        st.success(f"✅ Successfully deleted {len(selected_sno)} entries (Recorded under {role}).")
+                        st.rerun()
+                        
+        st.download_button(
+            label="📥 Export Filtered Ledger to CSV",
+            data=display_df.to_csv(index=False).encode('utf-8'),
+            file_name=f"HRS_Fuel_Ledger_{datetime.now().strftime('%d_%m_%Y')}.csv",
+            mime="text/csv",
+        )
+        
+        st.markdown("---")
+        st.subheader("✏️ Edit / Correct a Single Entry")
+        sno_to_amend = st.selectbox("Select S.No to Edit Values", display_df["S.No"].tolist())
         target_row = display_df[display_df["S.No"] == sno_to_amend].iloc[0]
         rec_id = target_row["Record ID"]
         
         st.write(
-            f"**Selected:** S.No {sno_to_amend} | {target_row['Vessel']} | "
+            f"**Editing S.No {sno_to_amend}:** {target_row['Vessel']} | "
             f"{target_row['Type']} | {target_row['Liters']}L | "
-            f"Logged By: **{target_row['Logged By']}**"
+            f"Originally Logged By: **{target_row['Logged By']}**"
         )
-        amend_opts = ["Correct Error (Adjust Data)", "Void/Delete Entry completely"]
-        amend_action = st.radio("Amendment Type", amend_opts)
+        amend_opts = ["Correct Error (Adjust Liters / Distance)", "Void/Delete This Entry"]
+        amend_action = st.radio("Action Type", amend_opts, horizontal=True)
         
         with st.form("amend_form"):
             new_liters = 0.0
             new_distance = 0.0
-            if amend_action == "Correct Error (Adjust Data)":
+            if amend_action == "Correct Error (Adjust Liters / Distance)":
                 a_col1, a_col2 = st.columns(2)
                 cur_l = float(pd.to_numeric(target_row['Liters'], errors='coerce') or 0.0)
                 cur_d = float(pd.to_numeric(target_row['Distance (NM)'], errors='coerce') or 0.0)
@@ -499,7 +612,7 @@ with tab3:
             
             amend_reason = st.text_input("Reason for Amendment (Required)")
             
-            if st.form_submit_button("Apply Amendment"):
+            if st.form_submit_button("💾 Apply Amendment"):
                 if not amend_reason:
                     st.error("You must provide a reason for the audit log.")
                 else:
@@ -508,7 +621,7 @@ with tab3:
                     idx_mask = st.session_state.ledger["Record ID"] == rec_id
                     st.session_state.ledger.loc[idx_mask, "Status"] = f"Voided (by {role})"
                     
-                    if amend_action == "Correct Error (Adjust Data)":
+                    if amend_action == "Correct Error (Adjust Liters / Distance)":
                         c_row = target_row.drop('S.No').to_dict()
                         c_row["Record ID"] = st.session_state.next_id
                         c_row["Timestamp"] = ts
@@ -534,7 +647,7 @@ with tab3:
                         st.success(f"S.No {sno_to_amend} voided by {role}.")
                     st.rerun()
     else:
-        st.info("No records match your filter.")
+        st.info("No active records match your filter.")
         
     st.markdown("---")
     
@@ -625,14 +738,14 @@ with tab3:
         st.info("Not enough consumption data logged yet to run comparisons.")
 
     st.markdown("---")
-    with st.expander("🔐 View Immutable Master Database (Includes Voided & Audit Data)"):
+    with st.expander("🔐 View Immutable Master Database & Audit History (Includes Voided & Deleted Records)"):
         st.dataframe(st.session_state.ledger, use_container_width=True, hide_index=True)
 
     # --- OWNER-ONLY PASSWORD MANAGEMENT ---
     if st.session_state.user_role == "Owner":
         st.markdown("---")
         st.subheader("🔑 Owner Security Settings (Manage Passwords)")
-        st.markdown("Change the Assistant's 4-digit PIN or your 6-digit Owner PIN anytime.")
+        st.markdown("Change the Assistant's 4-digit Password or your 6-digit Owner Password anytime.")
         
         sec_col1, sec_col2 = st.columns(2)
         
@@ -640,27 +753,27 @@ with tab3:
             with st.form("change_assistant_pin_form"):
                 st.markdown("**Change Assistant Password**")
                 cur_a = st.session_state.pins["assistant_pin"]
-                new_assist_pin = st.text_input("New 4-Digit Assistant PIN", value=cur_a, max_chars=4)
-                if st.form_submit_button("💾 Update Assistant PIN"):
+                new_assist_pin = st.text_input("New 4-Digit Assistant Password", value=cur_a, max_chars=4)
+                if st.form_submit_button("💾 Update Assistant Password"):
                     if len(new_assist_pin) != 4 or not new_assist_pin.isdigit():
-                        st.error("🚨 Assistant PIN must be strictly 4 numeric digits.")
+                        st.error("🚨 Assistant Password must be strictly 4 numeric digits.")
                     else:
                         st.session_state.pins["assistant_pin"] = new_assist_pin
                         save_pins(st.session_state.pins)
-                        st.success(f"✅ Assistant PIN updated to {new_assist_pin}!")
+                        st.success(f"✅ Assistant Password updated to {new_assist_pin}!")
                         
         with sec_col2:
             with st.form("change_owner_pin_form"):
                 st.markdown("**Change Owner Password**")
                 cur_o = st.session_state.pins["owner_pin"]
-                new_owner_pin = st.text_input("New 6-Digit Owner PIN", value=cur_o, max_chars=6)
-                if st.form_submit_button("💾 Update Owner PIN"):
+                new_owner_pin = st.text_input("New 6-Digit Owner Password", value=cur_o, max_chars=6)
+                if st.form_submit_button("💾 Update Owner Password"):
                     if len(new_owner_pin) != 6 or not new_owner_pin.isdigit():
-                        st.error("🚨 Owner PIN must be strictly 6 numeric digits.")
+                        st.error("🚨 Owner Password must be strictly 6 numeric digits.")
                     else:
                         st.session_state.pins["owner_pin"] = new_owner_pin
                         st.session_state.recovered_login = False
                         save_pins(st.session_state.pins)
-                        st.success(f"✅ Owner PIN updated to {new_owner_pin}!")
+                        st.success(f"✅ Owner Password updated to {new_owner_pin}!")
 
 # === END OF CODE ===
