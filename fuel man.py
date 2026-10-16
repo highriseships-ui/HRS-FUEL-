@@ -9,7 +9,7 @@ import io
 import hashlib
 
 # --- CONFIG & VERSIONING ---
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.3.4"
 st.set_page_config(page_title="HRS Fleet Manager", layout="wide", page_icon="⚓")
 
 # --- PERSISTENT STORAGE FILES ---
@@ -49,6 +49,12 @@ if "pins" not in st.session_state:
 
 if "processed_hashes" not in st.session_state:
     st.session_state.processed_hashes = load_hashes()
+
+# Initialize session state for the post-upload tally
+if "last_upload_filename" not in st.session_state:
+    st.session_state.last_upload_filename = None
+    st.session_state.last_upload_total = 0.0
+    st.session_state.last_upload_summary_df = pd.DataFrame()
 
 # --- TWO-TIER AUTHENTICATION GATE & RECOVERY ---
 if "authenticated" not in st.session_state:
@@ -111,7 +117,7 @@ with top_col2:
         st.rerun()
 with top_col3:
     components.html(
-        f"""
+        f'''
         <div style="font-family:sans-serif;text-align:right;color:gray;padding-top:10px;">
             <div id="clock" style="font-size:15px;font-weight:bold;"></div>
             <div style="font-size:13px;margin-top:2px;">Version: {APP_VERSION}</div>
@@ -128,7 +134,7 @@ with top_col3:
             }}
             updateClock();
         </script>
-        """,
+        ''',
         height=55
     )
 
@@ -414,6 +420,19 @@ with tab2:
 
     st.markdown("---")
     st.subheader("📂 Offline Logs: Bulk CSV Upload (Two-Tier Smart Safeguard)")
+
+    # --- IMMEDIATE POST-UPLOAD SUMMARY ---
+    if st.session_state.last_upload_filename:
+        st.success(f"✅ Data Injected Successfully from: **{st.session_state.last_upload_filename}**")
+        st.markdown("#### 📋 File Tally (Cross-check this with your paper notes)")
+        st.info(f"**Total Consumption Logged:** `{st.session_state.last_upload_total:.1f} L`")
+        if not st.session_state.last_upload_summary_df.empty:
+            st.dataframe(st.session_state.last_upload_summary_df, use_container_width=True, hide_index=True)
+        if st.button("Dismiss Tally"):
+            st.session_state.last_upload_filename = None
+            st.rerun()
+        st.markdown("---")
+
     st.info("Upload converted CSV files below. Identical files (even if renamed) are strictly blocked, while separate voyages with similar readings will prompt for your confirmation.")
     uploaded_csv = st.file_uploader("📂 Drag and drop your CSV file here, or tap to browse", type=["csv"])
     
@@ -431,6 +450,19 @@ with tab2:
             try:
                 df_upload = pd.read_csv(io.BytesIO(file_bytes))
                 
+                # --- SMART AUTO-MAPPER FOR VESSEL NAMES ---
+                if "Vessel" in df_upload.columns:
+                    def clean_vessel_name(raw_name):
+                        v_str = str(raw_name).lower()
+                        if "falcon" in v_str: return "Falcon High"
+                        if "aarya" in v_str or "arya" in v_str: return "Aarya"
+                        if "kingfisher" in v_str: return "Kingfisher"
+                        if "phoenix" in v_str: return "Phoenix"
+                        return str(raw_name).strip()
+                    
+                    df_upload["Vessel"] = df_upload["Vessel"].apply(clean_vessel_name)
+                # ------------------------------------------
+
                 # TIER 2: Smart Similarity Check
                 active_check_df = get_active_ledger()
                 similar_warnings = []
@@ -499,7 +531,24 @@ with tab2:
                     save_ledger()
                     st.session_state.processed_hashes.add(file_hash)
                     save_hashes(st.session_state.processed_hashes)
-                    st.success(f"✅ CSV '{uploaded_csv.name}' Uploaded Successfully by {st.session_state.user_role}!")
+                    
+                    # Compute Post-Upload Tally Before Rerun
+                    st.session_state.last_upload_filename = uploaded_csv.name
+                    df_tally = df_upload.copy()
+                    if "Type" not in df_tally.columns:
+                        df_tally["Type"] = "Consumption"
+                    if "Voyage No" not in df_tally.columns:
+                        df_tally["Voyage No"] = "Unknown"
+                        
+                    cons_tally = df_tally[df_tally["Type"].astype(str).str.contains("Consumption", case=False, na=False)].copy()
+                    cons_tally["Liters"] = pd.to_numeric(cons_tally.get("Liters", 0), errors="coerce").fillna(0.0)
+                    
+                    st.session_state.last_upload_total = cons_tally["Liters"].sum()
+                    if not cons_tally.empty:
+                        st.session_state.last_upload_summary_df = cons_tally.groupby(["Vessel", "Voyage No", "Equipment"])["Liters"].sum().reset_index()
+                    else:
+                        st.session_state.last_upload_summary_df = pd.DataFrame()
+
                     st.rerun()
             except Exception as e:
                 st.error(f"Error reading CSV format: {e}")
@@ -543,7 +592,7 @@ with tab3:
         
         pag_col1, pag_col2, pag_col3, pag_col4 = st.columns([2, 1, 1, 2])
         with pag_col1:
-            page_size_sel = st.selectbox("Rows per page:", [10, 25, 50, "All"], index=1)
+            page_size_sel = st.selectbox("Rows per page:", [10, 25, 50, "All"], index=0)
             
         page_size = total_rows if page_size_sel == "All" else int(page_size_sel)
         total_pages = max(1, (total_rows - 1) // page_size + 1)
@@ -692,9 +741,9 @@ with tab3:
         
     st.markdown("---")
     
-    # --- NUMERIC VOYAGE COMPARISON (TABULAR ONLY) ---
-    st.subheader("📈 Numeric Voyage Comparison")
-    st.markdown("Compare actual fuel spent per equipment in tabular format.")
+    # --- VOYAGE SUMMARIES AND COMPARISONS ---
+    st.subheader("📈 Voyage Summaries & Comparisons")
+    st.markdown("Verify individual voyages or compare actual fuel spent per equipment in tabular format.")
     
     cons_df = active_df[active_df["Type"] == "Consumption"].copy()
     
@@ -704,10 +753,27 @@ with tab3:
             cons_df["Voyage No"].astype(str) + " (" + cons_df["Voyage Month"].astype(str) + ")"
         )
         
-        modes = ["Compare Voyages (Single Vessel)", "Compare Vessels (Single Voyage)"]
-        analysis_mode = st.radio("Select Comparison Mode:", modes, horizontal=True)
-        
-        if analysis_mode == "Compare Voyages (Single Vessel)":
+        modes = ["Single Voyage Summary (Quick Check)", "Compare Voyages (Single Vessel)", "Compare Vessels (Single Voyage)"]
+        analysis_mode = st.radio("Select Analysis Mode:", modes, horizontal=True)
+
+        if analysis_mode == "Single Voyage Summary (Quick Check)":
+            v_comp = st.selectbox("Select Vessel", vessels, key="comp_ves_single_q")
+            v_df = cons_df[cons_df["Vessel"] == v_comp]
+            
+            u_voys = v_df["Voyage ID"].unique()
+            if len(u_voys) > 0:
+                voy_sel = st.selectbox("Select Voyage to Verify", u_voys, key="voy_sel_q")
+                voy_df_q = v_df[v_df["Voyage ID"] == voy_sel]
+                
+                tot_liters = voy_df_q["Liters"].sum()
+                st.markdown(f"### ⛽ Total Fuel Consumed: **{tot_liters:.1f} L**")
+                
+                b_df = voy_df_q.groupby("Equipment")["Liters"].sum().reset_index()
+                st.dataframe(b_df, use_container_width=True, hide_index=True)
+            else:
+                st.info(f"No consumption data logged for {v_comp} yet.")
+
+        elif analysis_mode == "Compare Voyages (Single Vessel)":
             v_comp = st.selectbox("Select Vessel", vessels, key="comp_ves_single")
             v_df = cons_df[cons_df["Vessel"] == v_comp]
             
